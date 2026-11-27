@@ -329,8 +329,50 @@ function isAdmin(message) {
   return message.chat.type === 'private' && adminChatIds.has(String(message.chat.id));
 }
 
+function escapeMarkdownV2(value) {
+  return String(value).replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+}
+
+function escapeMarkdownV2WithinLimit(value, maxLength = 3400) {
+  let escaped = '';
+  for (const character of String(value)) {
+    const safeCharacter = escapeMarkdownV2(character);
+    if (escaped.length + safeCharacter.length > maxLength) {
+      return `${escaped}\n…вывод сокращён`;
+    }
+    escaped += safeCharacter;
+  }
+  return escaped;
+}
+
+function fitMarkdownLines(lines, maxLength = 3400) {
+  const fitted = [];
+  let length = 0;
+  for (const line of lines) {
+    const addedLength = line.length + (fitted.length ? 1 : 0);
+    if (length + addedLength > maxLength) {
+      fitted.push('…список сокращён');
+      break;
+    }
+    fitted.push(line);
+    length += addedLength;
+  }
+  return fitted.join('\n');
+}
+
+async function sendMarkdown(chatId, text, options = {}) {
+  await bot.api.sendMessage(chatId, text, {
+    ...options,
+    parse_mode: 'MarkdownV2',
+  });
+}
+
 async function reply(message, text, keyboard = menuKeyboard) {
-  await bot.api.sendMessage(message.chat.id, text, { reply_markup: keyboard });
+  await sendMarkdown(message.chat.id, escapeMarkdownV2(text), { reply_markup: keyboard });
+}
+
+async function replyFormatted(message, markdown, keyboard = menuKeyboard) {
+  await sendMarkdown(message.chat.id, markdown, { reply_markup: keyboard });
 }
 
 function onAdminCommand(regex, handler) {
@@ -421,9 +463,9 @@ bot.on('message:text', async (context) => {
       saveReminders();
       if (snapshot.issues.length > 0) {
         try {
-          await bot.api.sendMessage(
+          await sendMarkdown(
             chatId,
-            `Срочное уведомление:\n${snapshot.issues.map((issue) => issue.message).join('\n\n')}`.slice(0, 3800),
+            `*🚨 Срочное уведомление*\n\n${escapeMarkdownV2WithinLimit(snapshot.issues.map((issue) => issue.message).join('\n\n'))}`,
           );
           for (const issue of snapshot.issues) {
             monitor.activeIssues[issue.key] = { message: issue.message, recovery: issue.recovery };
@@ -476,21 +518,28 @@ bot.on('message:text', async (context) => {
 });
 
 onAdminCommand(/^\/(?:start|help)(?:@\w+)?$/, async (message) => {
-  await reply(
+  await replyFormatted(
     message,
     [
-      'Команды управления сервером в PM2:',
-      '/status — состояние процесса',
-      '/logs [1-100] — последние строки логов',
-      '/resources — загрузка CPU, RAM и диска',
-      '/actions — последние действия администраторов',
-      '/startserver — запустить остановленный процесс',
-      '/stopserver — остановить процесс',
-      '/restartserver — перезапустить процесс',
-      'Для напоминания нажмите кнопку «⏰ Напоминание» и выберите интервал.',
-      'Бот проверяет PM2 и ошибки в логах каждые 30 секунд; уведомления и итоговый статус отправляются только вам.',
-      '/reminders — список ваших напоминаний',
-      '/cancelreminder ID — отменить напоминание',
+      '*🛠 Панель управления сервером*',
+      '',
+      '*Мониторинг*',
+      `📊 ${escapeMarkdownV2('/status')} — состояние PM2`,
+      `📋 ${escapeMarkdownV2('/logs')} — последние строки логов`,
+      `📈 ${escapeMarkdownV2('/resources')} — CPU, RAM и диск`,
+      `🧾 ${escapeMarkdownV2('/actions')} — журнал действий`,
+      '',
+      '*Управление*',
+      `▶️ ${escapeMarkdownV2('/startserver')} — запуск`,
+      `⏹ ${escapeMarkdownV2('/stopserver')} — остановка`,
+      `🔄 ${escapeMarkdownV2('/restartserver')} — перезапуск`,
+      '',
+      '*Наблюдение*',
+      'Нажмите «⏰ Напоминание» и выберите интервал\\.',
+      'Проверка выполняется каждые 30 секунд\\. Уведомления приходят только включившему наблюдение администратору\\.',
+      '',
+      `🗓 ${escapeMarkdownV2('/reminders')} — мои наблюдения`,
+      `❌ ${escapeMarkdownV2('/cancelreminder')} ID — отменить наблюдение`,
     ].join('\n'),
   );
 });
@@ -500,12 +549,16 @@ onAdminCommand(/^\/status(?:@\w+)?$/, async (message) => {
   const processes = JSON.parse(result.stdout);
   const target = processes.find((processInfo) => processInfo.name === processName);
   if (!target) {
-    await reply(message, `Процесс "${processName}" не найден в PM2.`);
+    await replyFormatted(message, `*❌ Процесс не найден*\n\nИмя: ${escapeMarkdownV2(processName)}\nПроверьте имя приложения в выводе \`pm2 list\`\\.`);
     return;
   }
 
   const state = target.pm2_env?.status || 'неизвестно';
-  await reply(message, `Процесс ${processName}: ${state}`);
+  const statusIcon = state === 'online' ? '🟢' : '🔴';
+  await replyFormatted(
+    message,
+    `*${statusIcon} Статус сервера*\n\n*Приложение:* ${escapeMarkdownV2(processName)}\n*Состояние:* ${escapeMarkdownV2(state)}`,
+  );
 });
 
 onAdminCommand(/^\/logs(?:@\w+)?(?:\s+(\d+))?$/, async (message, match) => {
@@ -517,20 +570,25 @@ onAdminCommand(/^\/logs(?:@\w+)?(?:\s+(\d+))?$/, async (message, match) => {
 
   const result = await run('pm2', ['logs', processName, '--lines', String(lines), '--nostream']);
   const output = [result.stdout, result.stderr].filter(Boolean).join('\n') || '(Логи пусты.)';
-  await reply(message, output.length > 3800 ? `${output.slice(-3800)}\n…вывод сокращён` : output);
+  await replyFormatted(
+    message,
+    `*📋 Логи ${escapeMarkdownV2(processName)}*\n_${lines} последних строк_\n\n${escapeMarkdownV2WithinLimit(output)}`,
+  );
 });
 
 onAdminCommand(/^\/resources(?:@\w+)?$/, async (message) => {
   const resources = await getResourceSnapshot();
   const memoryUsedGb = (resources.memoryUsed / 1024 ** 3).toFixed(1);
   const memoryTotalGb = (resources.memoryTotal / 1024 ** 3).toFixed(1);
-  await reply(
+  await replyFormatted(
     message,
     [
-      `CPU: ${resources.cpuPercent}% (тревога от ${cpuAlertPercent}%)`,
-      `RAM: ${resources.memoryPercent}% — ${memoryUsedGb}/${memoryTotalGb} GB (тревога от ${memoryAlertPercent}%)`,
-      `Свободно на диске ${resources.diskPath}: ${resources.diskFreePercent}% (тревога при ${diskFreeAlertPercent}% или меньше)`,
-      healthCheckUrl ? 'HTTP-проверка: настроена' : 'HTTP-проверка: не настроена',
+      '*📈 Ресурсы сервера*',
+      '',
+      `*CPU:* ${resources.cpuPercent}% _порог ${cpuAlertPercent}%_`,
+      `*RAM:* ${resources.memoryPercent}% — ${escapeMarkdownV2(memoryUsedGb)}/${escapeMarkdownV2(memoryTotalGb)} GB _порог ${memoryAlertPercent}%_`,
+      `*Диск ${escapeMarkdownV2(resources.diskPath)}:* свободно ${resources.diskFreePercent}% _тревога при ${diskFreeAlertPercent}% или меньше_`,
+      `*HTTP health\\-check:* ${healthCheckUrl ? 'включён' : 'не настроен'}`,
     ].join('\n'),
   );
 });
@@ -551,13 +609,13 @@ onAdminCommand(/^\/actions(?:@\w+)?$/, async (message) => {
     return;
   }
 
-  await reply(
+  await replyFormatted(
     message,
-    entries.map((entry) => {
+    `*🧾 Последние действия администраторов*\n\n${fitMarkdownLines(entries.map((entry) => {
       const username = entry.username ? `@${entry.username}` : entry.chatId;
       const detail = entry.detail ? ` — ${entry.detail}` : '';
-      return `${entry.timestamp} | ${username} | ${entry.action} | ${entry.result}${detail}`;
-    }).join('\n').slice(-3800),
+      return `• *${escapeMarkdownV2(entry.timestamp)}* | ${escapeMarkdownV2(username)} | ${escapeMarkdownV2(entry.action)} | ${escapeMarkdownV2(entry.result)}${escapeMarkdownV2(detail)}`;
+    }))}`,
   );
 });
 
@@ -585,16 +643,16 @@ onAdminCommand(/^\/reminders(?:@\w+)?$/, async (message) => {
     return;
   }
 
-  await reply(
+  await replyFormatted(
     message,
-    ownReminders
+    `*🗓 Ваши активные наблюдения*\n\n${fitMarkdownLines(ownReminders
       .map((reminder) => {
         const description = reminder.type === 'health-check'
           ? 'автоматическая проверка сервера'
           : reminder.text;
-        return `${reminder.id} — ${reminder.timestamp}: ${description}`;
+        return `• *${escapeMarkdownV2(reminder.id)}* — до ${escapeMarkdownV2(reminder.timestamp)}\n  ${escapeMarkdownV2(description)}`;
       })
-      .join('\n'),
+      .flatMap((entry) => entry.split('\n')))}`
   );
 });
 
@@ -686,9 +744,11 @@ async function deliverDueReminders() {
 
       if (newAlerts.length > 0 || recoveries.length > 0) {
         try {
-          await bot.api.sendMessage(
+          await sendMarkdown(
             monitor.chatId,
-            [...newAlerts.map((issue) => `🚨 ${issue}`), ...recoveries].join('\n\n').slice(0, 3800),
+            `*🚨 Мониторинг сервера*\n\n${escapeMarkdownV2WithinLimit(
+              [...newAlerts.map((issue) => `⚠️ ${issue}`), ...recoveries].join('\n\n'),
+            )}`,
           );
         } catch (error) {
           console.error(`Could not deliver health alert to ${monitor.chatId}: ${error.message}`);
@@ -705,9 +765,9 @@ async function deliverDueReminders() {
       if (due) {
         let report;
         if (snapshotError) {
-          report = `Не удалось выполнить итоговую проверку сервера:\n${snapshotError.message}`;
+          report = `*⚠️ Не удалось проверить сервер*\n\n${escapeMarkdownV2WithinLimit(snapshotError.message, 2500)}`;
         } else if (monitor.observedIssues.length === 0 && snapshot.issues.length === 0) {
-          report = 'Никаких проблем с сервером не обнаружено.';
+          report = '*✅ Проверка завершена*\n\nНикаких проблем с сервером не обнаружено\\.';
         } else {
           const uniqueIssues = [...new Set(monitor.observedIssues)];
           const repeatedIssues = Object.entries(monitor.issueCounts)
@@ -717,17 +777,17 @@ async function deliverDueReminders() {
               return issue ? `${issue} (наблюдалась в ${count} проверках)` : null;
             })
             .filter(Boolean);
-          report = `За время наблюдения обнаружены проблемы:\n${uniqueIssues.join('\n')}`;
+          report = `*⚠️ Проверка завершена: обнаружены проблемы*\n\n${escapeMarkdownV2WithinLimit(uniqueIssues.join('\n'), 1800)}`;
           if (repeatedIssues.length > 0) {
-            report += `\n\nПовторяющиеся сигналы:\n${repeatedIssues.join('\n')}`;
+            report += `\n\n*Повторяющиеся сигналы*\n${escapeMarkdownV2WithinLimit(repeatedIssues.join('\n'), 800)}`;
           }
           if (snapshot.resources) {
-            report += `\n\nИтоговые ресурсы: CPU ${snapshot.resources.cpuPercent}%, RAM ${snapshot.resources.memoryPercent}%, свободно на диске ${snapshot.resources.diskFreePercent}%.`;
+            report += `\n\n*📈 Итоговые ресурсы*\nCPU: ${snapshot.resources.cpuPercent}%\nRAM: ${snapshot.resources.memoryPercent}%\nСвободно на диске: ${snapshot.resources.diskFreePercent}%`;
           }
         }
 
         try {
-          await bot.api.sendMessage(monitor.chatId, report.slice(0, 3900));
+          await sendMarkdown(monitor.chatId, report);
           reminders = reminders.filter((reminder) => reminder.id !== monitor.id);
           saveReminders();
         } catch (error) {
@@ -738,9 +798,9 @@ async function deliverDueReminders() {
 
     for (const reminder of dueLegacyReminders) {
       try {
-        await bot.api.sendMessage(
+        await sendMarkdown(
           reminder.chatId,
-          `Напоминание (${reminder.timestamp}):\n${reminder.text}`,
+          `*⏰ Напоминание*\n\n*Время:* ${escapeMarkdownV2(reminder.timestamp)}\n*Текст:* ${escapeMarkdownV2WithinLimit(reminder.text, 2500)}`,
         );
         reminders = reminders.filter((item) => item.id !== reminder.id);
         saveReminders();
