@@ -380,5 +380,3 @@ bot.start().catch((error) => {
   console.error(`Could not start Telegram polling: ${error.message}`);
   process.exitCode = 1;
 });
-
-//
