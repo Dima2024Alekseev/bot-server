@@ -1,0 +1,17 @@
+{
+  "name": "vps-admin-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram bot for restricted VPS service management",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.48.0"
+  }
+}
