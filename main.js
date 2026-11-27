@@ -74,27 +74,42 @@ function run(command, args, { allowFailure = false } = {}) {
 
 const bot = new Bot(token);
 const commandHandlers = [];
+const menuKeyboard = {
+  inline_keyboard: [
+    [
+      { text: '📊 Статус', callback_data: 'command:/status' },
+      { text: '📋 Логи', callback_data: 'command:/logs' },
+    ],
+    [
+      { text: '▶️ Запустить', callback_data: 'command:/startserver' },
+      { text: '🔄 Перезапустить', callback_data: 'confirm:restartserver' },
+    ],
+    [
+      { text: '⏹ Остановить', callback_data: 'confirm:stopserver' },
+      { text: '⏰ Напоминание', callback_data: 'command:/remind' },
+    ],
+    [
+      { text: '🗓 Мои напоминания', callback_data: 'command:/reminders' },
+      { text: 'ℹ️ Помощь', callback_data: 'command:/help' },
+    ],
+  ],
+};
 
 function isAdmin(message) {
   return message.chat.type === 'private' && adminChatIds.has(String(message.chat.id));
 }
 
 async function reply(message, text) {
-  await bot.api.sendMessage(message.chat.id, text);
+  await bot.api.sendMessage(message.chat.id, text, { reply_markup: menuKeyboard });
 }
 
 function onAdminCommand(regex, handler) {
   commandHandlers.push({ regex, handler });
 }
 
-bot.on('message:text', async (context) => {
-  const message = context.message;
-  if (!isAdmin(message)) {
-    return;
-  }
-
+async function executeCommand(message, text) {
   const command = commandHandlers
-    .map(({ regex, handler }) => ({ match: regex.exec(message.text), handler }))
+    .map(({ regex, handler }) => ({ match: regex.exec(text), handler }))
     .find(({ match }) => match);
   if (!command) {
     return;
@@ -106,6 +121,15 @@ bot.on('message:text', async (context) => {
     console.error(`Command failed: ${error.message}`);
     await reply(message, `Ошибка: ${error.message}`);
   }
+}
+
+bot.on('message:text', async (context) => {
+  const message = context.message;
+  if (!isAdmin(message)) {
+    return;
+  }
+
+  await executeCommand(message, message.text);
 });
 
 onAdminCommand(/^\/(?:start|help)(?:@\w+)?$/, async (message) => {
@@ -248,6 +272,50 @@ onAdminCommand(/^\/cancelreminder(?:@\w+)?\s+([a-f0-9-]+)$/i, async (message, ma
   reminders.splice(index, 1);
   saveReminders();
   await reply(message, 'Напоминание отменено.');
+});
+
+bot.on('callback_query:data', async (context) => {
+  const query = context.callbackQuery;
+  const message = query.message;
+  const isAuthorized =
+    message?.chat.type === 'private' &&
+    String(message.chat.id) === String(query.from.id) &&
+    adminChatIds.has(String(query.from.id));
+
+  await context.answerCallbackQuery();
+  if (!isAuthorized) {
+    return;
+  }
+
+  const [action, value] = query.data.split(':', 2);
+  if (action === 'confirm' && ['stopserver', 'restartserver'].includes(value)) {
+    const verb = value === 'stopserver' ? 'остановить' : 'перезапустить';
+    await context.editMessageText(`Подтвердите: ${verb} сервер «${processName}»?`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Да, подтвердить', callback_data: `run:/${value}` },
+            { text: '↩️ Отмена', callback_data: 'menu' },
+          ],
+        ],
+      },
+    });
+    return;
+  }
+
+  if (action === 'menu') {
+    await context.editMessageText('Панель управления сервером:', { reply_markup: menuKeyboard });
+    return;
+  }
+
+  if (action === 'command' && value) {
+    await executeCommand(message, value);
+    return;
+  }
+
+  if (action === 'run' && value && /^\/(?:stopserver|restartserver)$/.test(value)) {
+    await executeCommand(message, value);
+  }
 });
 
 let checkingReminders = false;
