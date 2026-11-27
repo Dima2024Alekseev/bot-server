@@ -75,7 +75,15 @@ function run(command, args, { allowFailure = false } = {}) {
 const bot = new Bot(token);
 const commandHandlers = [];
 const pendingConfirmations = new Map();
+const pendingReminderTexts = new Map();
 const cancelConfirmationText = '↩️ Отмена';
+const cancelReminderText = '↩️ Отменить напоминание';
+const reminderDurations = new Map([
+  ['10 минут', 10 * 60 * 1000],
+  ['30 минут', 30 * 60 * 1000],
+  ['1 час', 60 * 60 * 1000],
+  ['1,5 часа', 90 * 60 * 1000],
+]);
 const menuKeyboard = {
   keyboard: [
     ['📊 Статус', '📋 Логи'],
@@ -83,6 +91,20 @@ const menuKeyboard = {
     ['⏹ Остановить', '⏰ Напоминание'],
     ['🗓 Мои напоминания', 'ℹ️ Помощь'],
   ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+const reminderDurationKeyboard = {
+  keyboard: [
+    ['10 минут', '30 минут'],
+    ['1 час', '1,5 часа'],
+    [cancelReminderText],
+  ],
+  resize_keyboard: true,
+  one_time_keyboard: true,
+};
+const reminderTextKeyboard = {
+  keyboard: [[cancelReminderText], ...menuKeyboard.keyboard],
   resize_keyboard: true,
   is_persistent: true,
 };
@@ -139,10 +161,58 @@ bot.on('message:text', async (context) => {
     ['📊 Статус', '/status'],
     ['📋 Логи', '/logs'],
     ['▶️ Запустить', '/startserver'],
-    ['⏰ Напоминание', '/remind'],
     ['🗓 Мои напоминания', '/reminders'],
     ['ℹ️ Помощь', '/help'],
   ]);
+
+  if (message.text === '↩️ Отмена' || message.text === cancelReminderText) {
+    pendingReminderTexts.delete(chatId);
+    pendingConfirmations.delete(chatId);
+    await reply(message, 'Действие отменено.');
+    return;
+  }
+
+  if (message.text === '⏰ Напоминание') {
+    pendingReminderTexts.delete(chatId);
+    await reply(message, 'Через какое время отправить напоминание?', reminderDurationKeyboard);
+    return;
+  }
+
+  const durationMs = reminderDurations.get(message.text);
+  if (durationMs) {
+    pendingReminderTexts.set(chatId, { durationMs, expiresAt: Date.now() + 5 * 60_000 });
+    await reply(message, `Напоминание через ${message.text}. Теперь отправьте его текст:`, reminderTextKeyboard);
+    return;
+  }
+
+  const pendingReminder = pendingReminderTexts.get(chatId);
+  if (pendingReminder) {
+    pendingReminderTexts.delete(chatId);
+    if (pendingReminder.expiresAt > Date.now()) {
+      if (message.text.startsWith('/') || actions.has(message.text) || message.text === '⏰ Напоминание') {
+        await reply(message, 'Создание напоминания отменено.');
+      } else {
+        const text = message.text.trim();
+        if (!text || text.length > 1000) {
+          await reply(message, 'Текст напоминания должен содержать от 1 до 1000 символов.');
+          return;
+        }
+
+        const timestamp = new Date(Date.now() + pendingReminder.durationMs).toISOString();
+        const reminder = {
+          id: randomUUID().slice(0, 8),
+          chatId,
+          timestamp,
+          text,
+        };
+        reminders.push(reminder);
+        saveReminders();
+        await reply(message, `Напоминание ${reminder.id} запланировано на ${timestamp}.`);
+        return;
+      }
+    }
+  }
+
   if (actions.has(message.text)) {
     await executeCommand(message, actions.get(message.text));
     return;
