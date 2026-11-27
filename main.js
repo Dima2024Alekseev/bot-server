@@ -74,33 +74,25 @@ function run(command, args, { allowFailure = false } = {}) {
 
 const bot = new Bot(token);
 const commandHandlers = [];
+const pendingConfirmations = new Map();
+const cancelConfirmationText = '↩️ Отмена';
 const menuKeyboard = {
-  inline_keyboard: [
-    [
-      { text: '📊 Статус', callback_data: 'command:/status' },
-      { text: '📋 Логи', callback_data: 'command:/logs' },
-    ],
-    [
-      { text: '▶️ Запустить', callback_data: 'command:/startserver' },
-      { text: '🔄 Перезапустить', callback_data: 'confirm:restartserver' },
-    ],
-    [
-      { text: '⏹ Остановить', callback_data: 'confirm:stopserver' },
-      { text: '⏰ Напоминание', callback_data: 'command:/remind' },
-    ],
-    [
-      { text: '🗓 Мои напоминания', callback_data: 'command:/reminders' },
-      { text: 'ℹ️ Помощь', callback_data: 'command:/help' },
-    ],
+  keyboard: [
+    ['📊 Статус', '📋 Логи'],
+    ['▶️ Запустить', '🔄 Перезапустить'],
+    ['⏹ Остановить', '⏰ Напоминание'],
+    ['🗓 Мои напоминания', 'ℹ️ Помощь'],
   ],
+  resize_keyboard: true,
+  is_persistent: true,
 };
 
 function isAdmin(message) {
   return message.chat.type === 'private' && adminChatIds.has(String(message.chat.id));
 }
 
-async function reply(message, text) {
-  await bot.api.sendMessage(message.chat.id, text, { reply_markup: menuKeyboard });
+async function reply(message, text, keyboard = menuKeyboard) {
+  await bot.api.sendMessage(message.chat.id, text, { reply_markup: keyboard });
 }
 
 function onAdminCommand(regex, handler) {
@@ -126,6 +118,52 @@ async function executeCommand(message, text) {
 bot.on('message:text', async (context) => {
   const message = context.message;
   if (!isAdmin(message)) {
+    return;
+  }
+
+  const chatId = String(message.chat.id);
+  const pending = pendingConfirmations.get(chatId);
+  if (pending) {
+    pendingConfirmations.delete(chatId);
+    if (pending.expiresAt > Date.now() && message.text === pending.confirmText) {
+      await executeCommand(message, `/${pending.command}`);
+      return;
+    }
+    if (pending.expiresAt > Date.now() && message.text === cancelConfirmationText) {
+      await reply(message, 'Действие отменено.');
+      return;
+    }
+  }
+
+  const actions = new Map([
+    ['📊 Статус', '/status'],
+    ['📋 Логи', '/logs'],
+    ['▶️ Запустить', '/startserver'],
+    ['⏰ Напоминание', '/remind'],
+    ['🗓 Мои напоминания', '/reminders'],
+    ['ℹ️ Помощь', '/help'],
+  ]);
+  if (actions.has(message.text)) {
+    await executeCommand(message, actions.get(message.text));
+    return;
+  }
+
+  const confirmations = new Map([
+    ['🔄 Перезапустить', { command: 'restartserver', confirmText: '✅ Да, перезапустить' }],
+    ['⏹ Остановить', { command: 'stopserver', confirmText: '✅ Да, остановить' }],
+  ]);
+  const confirmation = confirmations.get(message.text);
+  if (confirmation) {
+    pendingConfirmations.set(chatId, { ...confirmation, expiresAt: Date.now() + 60_000 });
+    await reply(
+      message,
+      `Подтвердите действие с сервером «${processName}» в течение минуты:`,
+      {
+        keyboard: [[confirmation.confirmText], [cancelConfirmationText]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    );
     return;
   }
 
@@ -274,50 +312,6 @@ onAdminCommand(/^\/cancelreminder(?:@\w+)?\s+([a-f0-9-]+)$/i, async (message, ma
   await reply(message, 'Напоминание отменено.');
 });
 
-bot.on('callback_query:data', async (context) => {
-  const query = context.callbackQuery;
-  const message = query.message;
-  const isAuthorized =
-    message?.chat.type === 'private' &&
-    String(message.chat.id) === String(query.from.id) &&
-    adminChatIds.has(String(query.from.id));
-
-  await context.answerCallbackQuery();
-  if (!isAuthorized) {
-    return;
-  }
-
-  const [action, value] = query.data.split(':', 2);
-  if (action === 'confirm' && ['stopserver', 'restartserver'].includes(value)) {
-    const verb = value === 'stopserver' ? 'остановить' : 'перезапустить';
-    await context.editMessageText(`Подтвердите: ${verb} сервер «${processName}»?`, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: '✅ Да, подтвердить', callback_data: `run:/${value}` },
-            { text: '↩️ Отмена', callback_data: 'menu' },
-          ],
-        ],
-      },
-    });
-    return;
-  }
-
-  if (action === 'menu') {
-    await context.editMessageText('Панель управления сервером:', { reply_markup: menuKeyboard });
-    return;
-  }
-
-  if (action === 'command' && value) {
-    await executeCommand(message, value);
-    return;
-  }
-
-  if (action === 'run' && value && /^\/(?:stopserver|restartserver)$/.test(value)) {
-    await executeCommand(message, value);
-  }
-});
-
 let checkingReminders = false;
 async function deliverDueReminders() {
   if (checkingReminders) {
@@ -380,4 +374,3 @@ bot.start().catch((error) => {
   console.error(`Could not start Telegram polling: ${error.message}`);
   process.exitCode = 1;
 });
-
