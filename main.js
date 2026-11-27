@@ -72,10 +72,31 @@ function run(command, args, { allowFailure = false } = {}) {
   });
 }
 
+function issueSignature(issue) {
+  return issue.trim().toLowerCase();
+}
+
+async function getHealthSnapshot() {
+  const statusResult = await run('pm2', ['jlist']);
+  const processes = JSON.parse(statusResult.stdout);
+  const processInfo = processes.find((entry) => entry.name === processName);
+  const state = processInfo?.pm2_env?.status || 'not found';
+  const logsResult = await run('pm2', ['logs', processName, '--lines', '100', '--nostream']);
+  const logText = [logsResult.stdout, logsResult.stderr].filter(Boolean).join('\n');
+  const logIssues = [...new Set(
+    logText
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && problemLogPatterns.some((pattern) => pattern.test(line)))
+      .map((line) => line.slice(0, 800)),
+  )].slice(-20);
+
+  return { state, logIssues };
+}
+
 const bot = new Bot(token);
 const commandHandlers = [];
 const pendingConfirmations = new Map();
-const pendingReminderTexts = new Map();
 const cancelConfirmationText = '↩️ Отмена';
 const cancelReminderText = '↩️ Отменить напоминание';
 const reminderDurations = new Map([
@@ -103,11 +124,13 @@ const reminderDurationKeyboard = {
   resize_keyboard: true,
   one_time_keyboard: true,
 };
-const reminderTextKeyboard = {
-  keyboard: [[cancelReminderText], ...menuKeyboard.keyboard],
-  resize_keyboard: true,
-  is_persistent: true,
-};
+const problemLogPatterns = [
+  /\b(?:ERROR|FATAL|CRITICAL)\b/i,
+  /Unhandled (?:exception|rejection)/i,
+  /\bEADDRINUSE\b/i,
+  /exited with code \[[1-9]\d*\]/i,
+  /\b(?:errored|crashed|uncaught exception)\b/i,
+];
 
 function isAdmin(message) {
   return message.chat.type === 'private' && adminChatIds.has(String(message.chat.id));
@@ -166,51 +189,62 @@ bot.on('message:text', async (context) => {
   ]);
 
   if (message.text === '↩️ Отмена' || message.text === cancelReminderText) {
-    pendingReminderTexts.delete(chatId);
     pendingConfirmations.delete(chatId);
     await reply(message, 'Действие отменено.');
     return;
   }
 
   if (message.text === '⏰ Напоминание') {
-    pendingReminderTexts.delete(chatId);
     await reply(message, 'Через какое время отправить напоминание?', reminderDurationKeyboard);
     return;
   }
 
   const durationMs = reminderDurations.get(message.text);
   if (durationMs) {
-    pendingReminderTexts.set(chatId, { durationMs, expiresAt: Date.now() + 5 * 60_000 });
-    await reply(message, `Напоминание через ${message.text}. Теперь отправьте его текст:`, reminderTextKeyboard);
-    return;
-  }
+    try {
+      const snapshot = await getHealthSnapshot();
+      const timestamp = new Date(Date.now() + durationMs).toISOString();
+      const ownMonitors = reminders.filter(
+        (reminder) => reminder.type === 'health-check' && reminder.chatId === chatId,
+      );
+      reminders = reminders.filter(
+        (reminder) => !(reminder.type === 'health-check' && reminder.chatId === chatId),
+      );
 
-  const pendingReminder = pendingReminderTexts.get(chatId);
-  if (pendingReminder) {
-    pendingReminderTexts.delete(chatId);
-    if (pendingReminder.expiresAt > Date.now()) {
-      if (message.text.startsWith('/') || actions.has(message.text) || message.text === '⏰ Напоминание') {
-        await reply(message, 'Создание напоминания отменено.');
-      } else {
-        const text = message.text.trim();
-        if (!text || text.length > 1000) {
-          await reply(message, 'Текст напоминания должен содержать от 1 до 1000 символов.');
-          return;
+      const monitor = {
+        id: randomUUID().slice(0, 8),
+        type: 'health-check',
+        chatId,
+        timestamp,
+        baselineLogIssues: snapshot.logIssues.map(issueSignature),
+        alertedLogIssues: [],
+        observedIssues: [],
+        lastReportedStatus: null,
+      };
+
+      reminders.push(monitor);
+      saveReminders();
+      if (snapshot.state !== 'online') {
+        const statusIssue = `PM2-процесс «${processName}» сейчас имеет статус: ${snapshot.state}.`;
+        try {
+          await bot.api.sendMessage(chatId, `Срочное уведомление:\n${statusIssue}`);
+          monitor.lastReportedStatus = snapshot.state;
+          monitor.observedIssues.push(statusIssue);
+          saveReminders();
+        } catch (error) {
+          console.error(`Could not deliver initial health alert to ${chatId}: ${error.message}`);
         }
-
-        const timestamp = new Date(Date.now() + pendingReminder.durationMs).toISOString();
-        const reminder = {
-          id: randomUUID().slice(0, 8),
-          chatId,
-          timestamp,
-          text,
-        };
-        reminders.push(reminder);
-        saveReminders();
-        await reply(message, `Напоминание ${reminder.id} запланировано на ${timestamp}.`);
-        return;
       }
+
+      await reply(
+        message,
+        `Наблюдение включено на ${message.text}. Проверяю PM2 и логи каждые 30 секунд. В конце пришлю результат только вам.${ownMonitors.length ? '\nВаше предыдущее наблюдение заменено.' : ''}`,
+      );
+    } catch (error) {
+      console.error(`Could not start health monitoring for ${chatId}: ${error.message}`);
+      await reply(message, `Не удалось включить наблюдение: ${error.message}`);
     }
+    return;
   }
 
   if (actions.has(message.text)) {
@@ -251,6 +285,7 @@ onAdminCommand(/^\/(?:start|help)(?:@\w+)?$/, async (message) => {
       '/stopserver — остановить процесс',
       '/restartserver — перезапустить процесс',
       'Для напоминания нажмите кнопку «⏰ Напоминание» и выберите интервал.',
+      'Бот проверяет PM2 и ошибки в логах каждые 30 секунд; уведомления и итоговый статус отправляются только вам.',
       '/reminders — список ваших напоминаний',
       '/cancelreminder ID — отменить напоминание',
     ].join('\n'),
@@ -303,7 +338,12 @@ onAdminCommand(/^\/reminders(?:@\w+)?$/, async (message) => {
   await reply(
     message,
     ownReminders
-      .map((reminder) => `${reminder.id} — ${reminder.timestamp}: ${reminder.text}`)
+      .map((reminder) => {
+        const description = reminder.type === 'health-check'
+          ? 'автоматическая проверка сервера'
+          : reminder.text;
+        return `${reminder.id} — ${reminder.timestamp}: ${description}`;
+      })
       .join('\n'),
   );
 });
@@ -330,33 +370,149 @@ async function deliverDueReminders() {
   checkingReminders = true;
 
   try {
-    const due = reminders.filter((reminder) => Date.parse(reminder.timestamp) <= Date.now());
-    if (due.length === 0) {
+    const now = Date.now();
+    const healthChecks = reminders.filter((reminder) => reminder.type === 'health-check');
+    const dueLegacyReminders = reminders.filter(
+      (reminder) => reminder.type !== 'health-check' && Date.parse(reminder.timestamp) <= now,
+    );
+    if (healthChecks.length === 0 && dueLegacyReminders.length === 0) {
       return;
     }
 
-    for (const reminder of due) {
-      if (!Array.isArray(reminder.deliveredChatIds)) {
-        reminder.deliveredChatIds = [];
+    let snapshot;
+    let snapshotError;
+    if (healthChecks.length > 0) {
+      try {
+        snapshot = await getHealthSnapshot();
+      } catch (error) {
+        snapshotError = error;
+        console.error(`Health check failed: ${error.message}`);
+      }
+    }
+
+    for (const monitor of healthChecks) {
+      const due = Date.parse(monitor.timestamp) <= now;
+      const newAlerts = [];
+      const newLogIssues = [];
+      const newObservedIssues = [];
+      let dirty = false;
+      let alertDeliveryFailed = false;
+      let nextReportedStatus = monitor.lastReportedStatus;
+      let nextCheckError = monitor.lastCheckError || null;
+
+      if (snapshotError) {
+        const errorText = `Не удалось проверить сервер: ${snapshotError.message}`;
+        if (nextCheckError !== snapshotError.message) {
+          newAlerts.push(errorText);
+          newObservedIssues.push(errorText);
+          nextCheckError = snapshotError.message;
+        }
+      } else {
+        if (nextCheckError) {
+          nextCheckError = null;
+          dirty = true;
+        }
+
+        if (snapshot.state === 'online') {
+          if (nextReportedStatus !== null) {
+            nextReportedStatus = null;
+            dirty = true;
+          }
+        } else if (nextReportedStatus !== snapshot.state) {
+          const statusIssue = `PM2-процесс «${processName}» имеет статус: ${snapshot.state}.`;
+          newAlerts.push(statusIssue);
+          newObservedIssues.push(statusIssue);
+          nextReportedStatus = snapshot.state;
+        }
+
+        const baseline = new Set(monitor.baselineLogIssues || []);
+        const alerted = new Set(monitor.alertedLogIssues || []);
+        const unseenLogIssues = snapshot.logIssues.filter((issue) => {
+          const signature = issueSignature(issue);
+          return !baseline.has(signature) && !alerted.has(signature);
+        });
+        for (const issue of unseenLogIssues.slice(0, 5)) {
+          newAlerts.push(`Ошибка в логах: ${issue}`);
+          newLogIssues.push(issue);
+          newObservedIssues.push(`Ошибка в логах: ${issue}`);
+        }
       }
 
-      for (const chatId of adminChatIds) {
-        if (reminder.deliveredChatIds.includes(chatId)) {
-          continue;
+      if (newAlerts.length > 0) {
+        try {
+          await bot.api.sendMessage(monitor.chatId, `Срочное уведомление:\n${newAlerts.join('\n\n')}`);
+          for (const issue of newObservedIssues) {
+            if (!monitor.observedIssues.includes(issue)) {
+              monitor.observedIssues.push(issue);
+            }
+          }
+          monitor.lastReportedStatus = nextReportedStatus;
+          monitor.lastCheckError = nextCheckError;
+          if (!snapshotError) {
+            const alerted = new Set(monitor.alertedLogIssues || []);
+            for (const issue of newLogIssues) {
+              alerted.add(issueSignature(issue));
+            }
+            monitor.alertedLogIssues = [...alerted].slice(-200);
+          }
+          dirty = true;
+        } catch (error) {
+          console.error(`Could not deliver immediate health alert to ${monitor.chatId}: ${error.message}`);
+          alertDeliveryFailed = true;
+        }
+      } else {
+        monitor.lastReportedStatus = nextReportedStatus;
+        monitor.lastCheckError = nextCheckError;
+      }
+
+      if (dirty) {
+        saveReminders();
+      }
+
+      if (due) {
+        let report;
+        if (snapshotError) {
+          report = `Не удалось выполнить итоговую проверку сервера:\n${snapshotError.message}`;
+        } else if (
+          monitor.observedIssues.length === 0 &&
+          newObservedIssues.length === 0 &&
+          snapshot.state === 'online'
+        ) {
+          report = 'Никаких проблем с сервером не обнаружено.';
+        } else {
+          const issues = [...new Set([...monitor.observedIssues, ...newObservedIssues])];
+          if (alertDeliveryFailed) {
+            issues.push('Не удалось доставить срочное уведомление; обнаруженные события включены в этот итоговый отчёт.');
+          }
+          if (snapshot.state !== 'online') {
+            const statusIssue = `Текущий статус PM2-процесса: ${snapshot.state}.`;
+            if (!issues.includes(statusIssue)) {
+              issues.push(statusIssue);
+            }
+          }
+          report = `За время наблюдения обнаружены проблемы:\n${issues.join('\n')}`;
         }
 
         try {
-          await bot.api.sendMessage(chatId, `Напоминание (${reminder.timestamp}):\n${reminder.text}`);
-          reminder.deliveredChatIds.push(chatId);
+          await bot.api.sendMessage(monitor.chatId, report.slice(0, 3900));
+          reminders = reminders.filter((reminder) => reminder.id !== monitor.id);
           saveReminders();
         } catch (error) {
-          console.error(`Could not deliver reminder ${reminder.id} to ${chatId}: ${error.message}`);
+          console.error(`Could not deliver health report to ${monitor.chatId}: ${error.message}`);
         }
       }
+    }
 
-      if ([...adminChatIds].every((chatId) => reminder.deliveredChatIds.includes(chatId))) {
+    for (const reminder of dueLegacyReminders) {
+      try {
+        await bot.api.sendMessage(
+          reminder.chatId,
+          `Напоминание (${reminder.timestamp}):\n${reminder.text}`,
+        );
         reminders = reminders.filter((item) => item.id !== reminder.id);
         saveReminders();
+      } catch (error) {
+        console.error(`Could not deliver reminder ${reminder.id} to ${reminder.chatId}: ${error.message}`);
       }
     }
   } catch (error) {
@@ -366,7 +522,7 @@ async function deliverDueReminders() {
   }
 }
 
-setInterval(deliverDueReminders, 15000);
+setInterval(deliverDueReminders, 30000);
 bot.catch((error) => console.error(`Telegram bot error: ${error.message}`));
 bot.api.setMyCommands([
   { command: 'status', description: 'Состояние процесса в PM2' },
