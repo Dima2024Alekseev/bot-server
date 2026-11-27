@@ -250,11 +250,9 @@ onAdminCommand(/^\/(?:start|help)(?:@\w+)?$/, async (message) => {
       '/startserver — запустить остановленный процесс',
       '/stopserver — остановить процесс',
       '/restartserver — перезапустить процесс',
-      '/remind YYYY-MM-DDTHH:mm:ss+07:00 текст — создать напоминание',
+      'Для напоминания нажмите кнопку «⏰ Напоминание» и выберите интервал.',
       '/reminders — список ваших напоминаний',
       '/cancelreminder ID — отменить напоминание',
-      '',
-      'Время указывайте с часовым поясом (например, +07:00 или Z).',
     ].join('\n'),
   );
 });
@@ -294,64 +292,6 @@ for (const [command, action, verb] of [
     await reply(message, `Команда выполнена: процесс ${processName} ${verb}.`);
   });
 }
-
-function parseReminderDate(value) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
-  if (!match) {
-    return null;
-  }
-
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0', , , offsetHourText, offsetMinuteText] = match;
-  const year = Number(yearText);
-  const month = Number(monthText);
-  const day = Number(dayText);
-  const hour = Number(hourText);
-  const minute = Number(minuteText);
-  const second = Number(secondText);
-  const calendarDate = new Date(Date.UTC(year, month - 1, day));
-  if (
-    calendarDate.getUTCFullYear() !== year ||
-    calendarDate.getUTCMonth() !== month - 1 ||
-    calendarDate.getUTCDate() !== day ||
-    hour > 23 ||
-    minute > 59 ||
-    second > 59 ||
-    (offsetHourText && (Number(offsetHourText) > 23 || Number(offsetMinuteText) > 59))
-  ) {
-    return null;
-  }
-
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && timestamp > Date.now() ? new Date(timestamp) : null;
-}
-
-onAdminCommand(/^\/remind(?:@\w+)?\s+(\S+)\s+([\s\S]+)$/, async (message, match) => {
-  const date = parseReminderDate(match[1]);
-  const text = match[2].trim();
-
-  if (!date) {
-    await reply(message, 'Неверное или прошедшее время. Укажите дату ISO с часовым поясом, например YYYY-MM-DDTHH:mm:ss+07:00.');
-    return;
-  }
-  if (!text || text.length > 1000) {
-    await reply(message, 'Текст напоминания должен содержать от 1 до 1000 символов.');
-    return;
-  }
-
-  const reminder = {
-    id: randomUUID().slice(0, 8),
-    chatId: String(message.chat.id),
-    timestamp: date.toISOString(),
-    text,
-  };
-  reminders.push(reminder);
-  saveReminders();
-  await reply(message, `Напоминание ${reminder.id} запланировано на ${date.toISOString()}.`);
-});
-
-onAdminCommand(/^\/remind(?:@\w+)?$/, async (message) => {
-  await reply(message, 'Формат: /remind YYYY-MM-DDTHH:mm:ss+07:00 текст напоминания');
-});
 
 onAdminCommand(/^\/reminders(?:@\w+)?$/, async (message) => {
   const ownReminders = reminders.filter((reminder) => reminder.chatId === String(message.chat.id));
@@ -434,7 +374,6 @@ bot.api.setMyCommands([
   { command: 'startserver', description: 'Запустить процесс' },
   { command: 'stopserver', description: 'Остановить процесс' },
   { command: 'restartserver', description: 'Перезапустить процесс' },
-  { command: 'remind', description: 'Создать напоминание' },
   { command: 'reminders', description: 'Список напоминаний' },
   { command: 'cancelreminder', description: 'Отменить напоминание' },
 ]).catch((error) => console.error(`Could not register bot commands: ${error.message}`));
